@@ -25,9 +25,19 @@ def readImages(renders_dir, gt_dir):
     renders = []
     gts = []
     image_names = []
+    if not os.path.exists(renders_dir):
+        return renders, gts, image_names
+    if not os.path.exists(gt_dir):
+        return renders, gts, image_names
     for fname in os.listdir(renders_dir):
-        render = Image.open(renders_dir / fname)
-        gt = Image.open(gt_dir / fname)
+        if not fname.endswith('.png'):
+            continue
+        render_path = renders_dir / fname
+        gt_path = gt_dir / fname
+        if not os.path.exists(gt_path):
+            continue
+        render = Image.open(render_path)
+        gt = Image.open(gt_path)
         renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
         gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
         image_names.append(fname)
@@ -63,6 +73,15 @@ def evaluate(model_paths):
                 gt_dir = method_dir/ "gt"
                 renders_dir = method_dir / "renders"
                 renders, gts, image_names = readImages(renders_dir, gt_dir)
+
+                if len(renders) == 0:
+                    print(f"  Warning: No rendered images found in {renders_dir}")
+                    print(f"  Make sure you trained with --eval flag and rendered test images.")
+                    print("  SSIM :          nan")
+                    print("  PSNR :          nan")
+                    print("  LPIPS:          nan")
+                    print("")
+                    continue
 
                 ssims = []
                 psnrs = []

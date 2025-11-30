@@ -108,8 +108,60 @@ def fetchPly(path):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-    colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    
+    # Get available property names from the vertex element
+    vertex_props = [p.name for p in plydata['vertex'].properties]
+    
+    # Try to get colors - handle different field name variations
+    colors = None
+    color_field_variants = [
+        (['red', 'green', 'blue'], 255.0),  # Standard COLMAP format (0-255)
+        (['r', 'g', 'b'], 255.0),           # Short names (0-255)
+        (['diffuse_red', 'diffuse_green', 'diffuse_blue'], 255.0),  # Some PLY formats
+        (['red', 'green', 'blue'], 1.0),    # Already normalized (0-1)
+        (['r', 'g', 'b'], 1.0),             # Short names normalized
+    ]
+    
+    for color_fields, scale in color_field_variants:
+        if all(field in vertex_props for field in color_fields):
+            try:
+                colors = np.vstack([vertices[color_fields[0]], 
+                                  vertices[color_fields[1]], 
+                                  vertices[color_fields[2]]]).T
+                if scale != 1.0:
+                    colors = colors / scale
+                # Clamp to [0, 1] range
+                colors = np.clip(colors, 0.0, 1.0)
+                break
+            except (KeyError, ValueError, TypeError):
+                continue
+    
+    # If no colors found, use white
+    if colors is None:
+        print(f"Warning: No color fields found in PLY file. Available fields: {vertex_props}. Using white colors.")
+        colors = np.ones((positions.shape[0], 3))
+    
+    # Try to get normals - handle different field name variations
+    normals = None
+    normal_field_variants = [
+        ['nx', 'ny', 'nz'],      # Standard format
+        ['normal_x', 'normal_y', 'normal_z'],  # Alternative format
+    ]
+    
+    for normal_fields in normal_field_variants:
+        if all(field in vertex_props for field in normal_fields):
+            try:
+                normals = np.vstack([vertices[normal_fields[0]], 
+                                   vertices[normal_fields[1]], 
+                                   vertices[normal_fields[2]]]).T
+                break
+            except (KeyError, ValueError, TypeError):
+                continue
+    
+    # If no normals found, use zeros
+    if normals is None:
+        normals = np.zeros((positions.shape[0], 3))
+    
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):
@@ -129,7 +181,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, point_cloud_path=None, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -154,26 +206,52 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    # Use custom point cloud path if provided, otherwise use default location
+    ply_path = None
+    if point_cloud_path and point_cloud_path.strip():
+        if os.path.exists(point_cloud_path):
+            ply_path = point_cloud_path
+            print(f"Using custom point cloud: {ply_path}")
+        else:
+            print(f"Warning: Custom point cloud path specified but file not found: {point_cloud_path}")
+            print("Falling back to default location.")
+    
+    # If no custom path or custom path doesn't exist, use default location
+    if ply_path is None:
+        ply_path = os.path.join(path, "sparse/0/points3D.ply")
+        bin_path = os.path.join(path, "sparse/0/points3D.bin")
+        txt_path = os.path.join(path, "sparse/0/points3D.txt")
+        
+        # Only try to convert from .bin/.txt if .ply doesn't exist
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+                storePly(ply_path, xyz, rgb)
+            except FileNotFoundError:
+                try:
+                    xyz, rgb, _ = read_points3D_text(txt_path)
+                    storePly(ply_path, xyz, rgb)
+                except FileNotFoundError:
+                    print(f"Warning: No point cloud files found. Expected one of: {ply_path}, {bin_path}, or {txt_path}")
+                    print("Proceeding without initial point cloud. Training will start with random initialization.")
+                    ply_path = None
+    
+    # Load point cloud if path exists
+    if ply_path and os.path.exists(ply_path):
         try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
+            pcd = fetchPly(ply_path)
+        except Exception as e:
+            print(f"Warning: Failed to load point cloud from {ply_path}: {e}")
+            pcd = None
+    else:
         pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path if ply_path else os.path.join(path, "sparse/0/points3D.ply"))
     return scene_info
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):

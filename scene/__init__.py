@@ -41,7 +41,7 @@ class Scene:
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.point_cloud_path if hasattr(args, 'point_cloud_path') else None)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
@@ -80,6 +80,31 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
         else:
+            if scene_info.point_cloud is None:
+                # Create a basic point cloud from camera centers if PLY loading failed
+                print("Creating initial point cloud from camera centers...")
+                from scene.gaussian_model import BasicPointCloud
+                from utils.sh_utils import SH2RGB
+                import numpy as np
+                import torch
+                from utils.graphics_utils import getWorld2View2
+                
+                cam_centers = []
+                for cam_info in scene_info.train_cameras:
+                    W2C = getWorld2View2(cam_info.R, cam_info.T)
+                    C2W = np.linalg.inv(W2C)
+                    cam_centers.append(C2W[:3, 3:4])
+                cam_centers = np.hstack(cam_centers).T
+                
+                # Create points around camera centers
+                num_pts = 100_000
+                center = np.mean(cam_centers, axis=0)
+                scale = np.max(np.linalg.norm(cam_centers - center, axis=1)) * 1.5
+                xyz = np.random.random((num_pts, 3)) * 2 * scale - scale + center
+                colors = np.random.random((num_pts, 3))
+                normals = np.zeros((num_pts, 3))
+                scene_info.point_cloud = BasicPointCloud(points=xyz, colors=colors, normals=normals)
+            
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
     def save(self, iteration):
