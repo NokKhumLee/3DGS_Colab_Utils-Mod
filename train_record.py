@@ -33,6 +33,11 @@ except ImportError:
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, save_loss_csv=False):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    
+    # Configure SSIM implementation based on pipeline parameters
+    from utils.loss_utils import configure_ssim
+    configure_ssim(use_fused=pipe.use_fused_ssim, padding=pipe.ssim_padding)
+    
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
