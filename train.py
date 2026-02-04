@@ -23,21 +23,101 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import csv
+from datetime import datetime
+import platform
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, save_loss_csv=False):
+class MetadataLogger:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self._file = open(file_path, "w", encoding="utf-8")
+
+    def write_line(self, line=""):
+        self._file.write(f"{line}\n")
+        self._file.flush()
+
+    def write_section(self, title):
+        self.write_line("")
+        self.write_line(f"== {title} ==")
+
+    def close(self):
+        self._file.close()
+
+
+def _format_dict_for_metadata(data):
+    lines = []
+    for key in sorted(data.keys()):
+        lines.append(f"{key}: {data[key]}")
+    return lines
+
+
+def _get_scene_type(source_path):
+    if os.path.exists(os.path.join(source_path, "sparse")):
+        return "COLMAP"
+    if os.path.exists(os.path.join(source_path, "transforms_train.json")):
+        return "Blender"
+    return "Unknown"
+
+
+def _get_image_size_from_scene(scene):
+    train_cameras = scene.getTrainCameras()
+    if train_cameras and len(train_cameras) > 0:
+        cam = train_cameras[0]
+        return cam.image_width, cam.image_height
+    return None, None
+
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, save_loss_csv=False, full_args=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    metadata_logger = MetadataLogger(os.path.join(dataset.model_path, "metadata.txt"))
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    metadata_logger.write_section("Run Info")
+    metadata_logger.write_line(f"start_time: {datetime.now().isoformat()}")
+    metadata_logger.write_line(f"model_path: {dataset.model_path}")
+    metadata_logger.write_line(f"source_path: {dataset.source_path}")
+    metadata_logger.write_line(f"scene_type: {_get_scene_type(dataset.source_path)}")
+    metadata_logger.write_line(f"checkpoint: {checkpoint}")
+    metadata_logger.write_line(f"platform: {platform.platform()}")
+    metadata_logger.write_line(f"python: {platform.python_version()}")
+    metadata_logger.write_line(f"torch: {torch.__version__}")
+    metadata_logger.write_line(f"cuda_available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        metadata_logger.write_line(f"cuda_device_count: {torch.cuda.device_count()}")
+        metadata_logger.write_line(f"cuda_device_name: {torch.cuda.get_device_name(0)}")
+
+    metadata_logger.write_section("Training Parameters")
+    if full_args is not None:
+        for line in _format_dict_for_metadata(vars(full_args)):
+            metadata_logger.write_line(line)
+    else:
+        for line in _format_dict_for_metadata(vars(dataset)):
+            metadata_logger.write_line(line)
+        for line in _format_dict_for_metadata(vars(opt)):
+            metadata_logger.write_line(line)
+        for line in _format_dict_for_metadata(vars(pipe)):
+            metadata_logger.write_line(line)
+
+    metadata_logger.write_section("Dataset Summary")
+    train_cameras = scene.getTrainCameras()
+    test_cameras = scene.getTestCameras()
+    metadata_logger.write_line(f"train_cameras: {len(train_cameras)}")
+    metadata_logger.write_line(f"test_cameras: {len(test_cameras)}")
+    image_width, image_height = _get_image_size_from_scene(scene)
+    metadata_logger.write_line(f"image_width: {image_width}")
+    metadata_logger.write_line(f"image_height: {image_height}")
+    metadata_logger.write_line(f"cameras_extent: {scene.cameras_extent}")
+    metadata_logger.write_line(f"points_initial: {gaussians.get_xyz.shape[0]}")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -116,9 +196,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 csv_writer.writerow([iteration, loss.item(), Ll1.item(), ema_loss_for_log])
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), metadata_logger)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
+                metadata_logger.write_line(f"[ITER {iteration}] save_gaussians: true")
                 scene.save(iteration)
 
             # Densification
@@ -141,9 +222,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                metadata_logger.write_line(f"[ITER {iteration}] save_checkpoint: true")
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
     # Close CSV file if it was opened
+    metadata_logger.write_section("Final Summary")
+    metadata_logger.write_line(f"end_time: {datetime.now().isoformat()}")
+    metadata_logger.write_line(f"points_final: {gaussians.get_xyz.shape[0]}")
+    metadata_logger.close()
+
     if csv_file is not None:
         csv_file.close()
         print(f"\nLosses saved to: {csv_path}")
@@ -170,7 +257,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, metadata_logger=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -198,6 +285,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                if metadata_logger is not None:
+                    metadata_logger.write_line(
+                        f"[ITER {iteration}] eval_{config['name']}: l1={l1_test.item()} psnr={psnr_test.item()} cams={len(config['cameras'])}"
+                    )
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
@@ -205,6 +296,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        if metadata_logger is not None:
+            metadata_logger.write_line(f"[ITER {iteration}] total_points: {scene.gaussians.get_xyz.shape[0]}")
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -234,7 +327,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.save_loss_csv)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.save_loss_csv, args)
 
     # All done
     print("\nTraining complete.")
